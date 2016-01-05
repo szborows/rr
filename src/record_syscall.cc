@@ -1620,6 +1620,54 @@ static void destroy_buffers(Task* t) {
 }
 
 template <typename Arch>
+static double user_timespec_to_absolute_sec(
+    Task* t, remote_ptr<typename Arch::timespec> ts) {
+  if (ts.is_null()) {
+    return 0;
+  }
+  auto spec = t->read_mem(ts);
+  return monotonic_now_sec() + (double)spec.tv_sec + (double)spec.tv_nsec / 1e9;
+}
+
+template <typename Arch>
+static double absolute_realtime_timespec_to_absolute_sec(
+    Task* t, remote_ptr<typename Arch::timespec> ts) {
+  if (ts.is_null()) {
+    return 0;
+  }
+  auto spec = t->read_mem(ts);
+  // We need to convert CLOCK_REALTIME to CLOCK_MONOTONIC. This isn't
+  // 100% accurate but it'll do.
+  struct timespec now_realtime_ts;
+  clock_gettime(CLOCK_REALTIME, &now_realtime_ts);
+  double now_realtime =
+      (double)now_realtime_ts.tv_sec + (double)now_realtime_ts.tv_nsec / 1e9;
+  double then_realtime =
+      (double)spec.tv_sec + (double)spec.tv_nsec / 1e9;
+  return monotonic_now_sec() + (then_realtime - now_realtime);
+}
+
+template <typename Arch>
+static double absolute_monotonic_timespec_to_absolute_sec(
+    Task* t, remote_ptr<typename Arch::timespec> ts) {
+  if (ts.is_null()) {
+    return 0;
+  }
+  auto spec = t->read_mem(ts);
+  return (double)spec.tv_sec + (double)spec.tv_nsec / 1e9;
+}
+
+template <typename Arch>
+static double user_timeval_to_absolute_sec(
+    Task* t, remote_ptr<typename Arch::timeval> tv) {
+  if (tv.is_null()) {
+    return 0;
+  }
+  auto val = t->read_mem(tv);
+  return monotonic_now_sec() + (double)val.tv_sec + (double)val.tv_usec / 1e6;
+}
+
+template <typename Arch>
 static Switchable rec_prepare_syscall_arch(Task* t,
                                            TaskSyscallState& syscall_state) {
   int syscallno = t->ev().Syscall().number;
@@ -1812,11 +1860,26 @@ static Switchable rec_prepare_syscall_arch(Task* t,
      *           int *uaddr2, int val3);
      * futex parameters are in-out but they can't be moved to scratch
      * addresses. */
-    case Arch::futex:
-      switch ((int)t->regs().arg2_signed() & FUTEX_CMD_MASK) {
+    case Arch::futex: {
+      int op = t->regs().arg2_signed();
+      switch (op & FUTEX_CMD_MASK) {
         case FUTEX_WAIT:
+          syscall_state.reg_parameter<int>(1, IN_OUT_NO_SCRATCH);
+          t->sleeping_until =
+             user_timespec_to_absolute_sec<Arch>(t, t->regs().arg4());
+          break;
+
         case FUTEX_WAIT_BITSET:
           syscall_state.reg_parameter<int>(1, IN_OUT_NO_SCRATCH);
+          if (op & FUTEX_CLOCK_REALTIME) {
+            t->sleeping_until =
+                absolute_realtime_timespec_to_absolute_sec<Arch>(t, t->regs().arg4());
+          } else {
+            // Some man pages claim that FUTEX_WAIT_BITSET without
+            // FUTEX_CLOCK_REALTIME uses a relative timeout. That is incorrect.
+            t->sleeping_until =
+                absolute_monotonic_timespec_to_absolute_sec<Arch>(t, t->regs().arg4());
+          }
           break;
 
         case FUTEX_CMP_REQUEUE:
@@ -1836,6 +1899,7 @@ static Switchable rec_prepare_syscall_arch(Task* t,
       // We may be waking up a higher-priority thread; if so, allow it to run
       // immediately.
       return ALLOW_SWITCH;
+    }
 
     case Arch::getrandom:
       syscall_state.reg_parameter(
@@ -1933,11 +1997,16 @@ static Switchable rec_prepare_syscall_arch(Task* t,
             REMOTE_PTR_FIELD(argsp, except_fds), IN_OUT);
         syscall_state.mem_ptr_parameter_inferred(
             REMOTE_PTR_FIELD(argsp, timeout), IN_OUT);
+        auto args = t->read_mem(argsp);
+        t->sleeping_until =
+            user_timeval_to_absolute_sec<Arch>(t, args.timeout.rptr());
       } else {
         syscall_state.reg_parameter<typename Arch::fd_set>(2, IN_OUT);
         syscall_state.reg_parameter<typename Arch::fd_set>(3, IN_OUT);
         syscall_state.reg_parameter<typename Arch::fd_set>(4, IN_OUT);
         syscall_state.reg_parameter<typename Arch::timeval>(5, IN_OUT);
+        t->sleeping_until =
+            user_timeval_to_absolute_sec<Arch>(t, t->regs().arg5());
       }
       return ALLOW_SWITCH;
 
@@ -1946,6 +2015,8 @@ static Switchable rec_prepare_syscall_arch(Task* t,
       syscall_state.reg_parameter<typename Arch::fd_set>(3, IN_OUT);
       syscall_state.reg_parameter<typename Arch::fd_set>(4, IN_OUT);
       syscall_state.reg_parameter<typename Arch::timespec>(5, IN_OUT);
+      t->sleeping_until =
+          user_timespec_to_absolute_sec<Arch>(t, t->regs().arg5());
       return ALLOW_SWITCH;
 
     case Arch::recvfrom: {
@@ -2195,6 +2266,15 @@ static Switchable rec_prepare_syscall_arch(Task* t,
       auto nfds = (nfds_t)t->regs().arg2();
       syscall_state.reg_parameter(1, sizeof(typename Arch::pollfd) * nfds,
                                   IN_OUT);
+      if (syscallno == Arch::ppoll) {
+        t->sleeping_until =
+            user_timespec_to_absolute_sec<Arch>(t, t->regs().arg3());
+      } else {
+        if (t->regs().arg3() >= 0) {
+          t->sleeping_until =
+              monotonic_now_sec() + (double)t->regs().arg3() / 1000;
+        }
+      }
       return ALLOW_SWITCH;
     }
 
@@ -2407,6 +2487,8 @@ static Switchable rec_prepare_syscall_arch(Task* t,
     /* int nanosleep(const struct timespec *req, struct timespec *rem); */
     case Arch::nanosleep:
       syscall_state.reg_parameter<typename Arch::timespec>(2);
+      t->sleeping_until =
+          user_timespec_to_absolute_sec<Arch>(t, t->regs().arg1());
       return ALLOW_SWITCH;
 
     case Arch::sched_yield:
@@ -3126,6 +3208,7 @@ static void rec_process_syscall_arch(Task* t, TaskSyscallState& syscall_state) {
              << " -- time: " << t->trace_time();
 
   t->on_syscall_exit(syscallno, t->regs());
+  t->sleeping_until = 0;
 
   if (const struct syscallbuf_record* rec = t->desched_rec()) {
     t->record_local(t->syscallbuf_child.cast<void>() +
