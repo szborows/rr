@@ -782,11 +782,6 @@ static Switchable prepare_socketcall(Task* t, TaskSyscallState& syscall_state) {
     case SYS_BIND:
     /* int listen(int sockfd, int backlog) */
     case SYS_LISTEN:
-    /* ssize_t send(int sockfd, const void *buf, size_t len, int flags) */
-    case SYS_SEND:
-    /* ssize_t sendto(int sockfd, const void *buf, size_t len, int flags, const
-     * struct sockaddr *dest_addr, socklen_t addrlen); */
-    case SYS_SENDTO:
     /* int setsockopt(int sockfd, int level, int optname, const void *optval,
      * socklen_t optlen); */
     case SYS_SETSOCKOPT:
@@ -917,15 +912,16 @@ static Switchable prepare_socketcall(Task* t, TaskSyscallState& syscall_state) {
       break;
     }
 
+    /* ssize_t send(int sockfd, const void *buf, size_t len, int flags) */
+    case SYS_SEND:
+    /* ssize_t sendto(int sockfd, const void *buf, size_t len, int flags, const
+     * struct sockaddr *dest_addr, socklen_t addrlen); */
+    case SYS_SENDTO:
     /* ssize_t sendmsg(int sockfd, const struct msghdr *msg, int flags) */
-    case SYS_SENDMSG: {
-      auto argsp = remote_ptr<typename Arch::sendmsg_args>(t->regs().arg2());
-      auto args = t->read_mem(argsp);
-      if (!(args.flags & MSG_DONTWAIT)) {
-        return ALLOW_SWITCH;
-      }
-      break;
-    }
+    case SYS_SENDMSG:
+      // If we send a message to a higher-priority thread that's blocking on
+      // receive, allow it to run immediately.
+      return ALLOW_SWITCH;
 
     case SYS_SENDMMSG: {
       auto argsp =
@@ -934,10 +930,9 @@ static Switchable prepare_socketcall(Task* t, TaskSyscallState& syscall_state) {
       syscall_state.mem_ptr_parameter(
           REMOTE_PTR_FIELD(argsp, msgvec),
           sizeof(typename Arch::mmsghdr) * args.vlen, IN_OUT);
-      if (!(args.flags & MSG_DONTWAIT)) {
-        return ALLOW_SWITCH;
-      }
-      break;
+      // If we send a message to a higher-priority thread that's blocking on
+      // receive, allow it to run immediately.
+      return ALLOW_SWITCH;
     }
 
     default:
@@ -1759,8 +1754,6 @@ static Switchable rec_prepare_syscall_arch(Task* t,
         case Arch::GETFD:
         case Arch::GETFL:
         case Arch::SETFL:
-        case Arch::SETLK:
-        case Arch::SETLK64:
         case Arch::SETOWN:
         case Arch::SETOWN_EX:
         case Arch::GETSIG:
@@ -1797,6 +1790,10 @@ static Switchable rec_prepare_syscall_arch(Task* t,
           syscall_state.reg_parameter<typename Arch::f_owner_ex>(3);
           break;
 
+        case Arch::SETLK:
+        case Arch::SETLK64:
+          // SETLK doesn't block but we might want to allow a higher-priority
+          // thread/process to run immediately.
         case Arch::SETLKW:
         case Arch::SETLKW64:
           // SETLKW blocks, but doesn't write any
@@ -1820,7 +1817,7 @@ static Switchable rec_prepare_syscall_arch(Task* t,
         case FUTEX_WAIT:
         case FUTEX_WAIT_BITSET:
           syscall_state.reg_parameter<int>(1, IN_OUT_NO_SCRATCH);
-          return ALLOW_SWITCH;
+          break;
 
         case FUTEX_CMP_REQUEUE:
         case FUTEX_WAKE_OP:
@@ -1834,9 +1831,11 @@ static Switchable rec_prepare_syscall_arch(Task* t,
 
         default:
           syscall_state.expect_errno = EINVAL;
-          break;
+          return PREVENT_SWITCH;
       }
-      return PREVENT_SWITCH;
+      // We may be waking up a higher-priority thread; if so, allow it to run
+      // immediately.
+      return ALLOW_SWITCH;
 
     case Arch::getrandom:
       syscall_state.reg_parameter(
@@ -1984,20 +1983,11 @@ static Switchable rec_prepare_syscall_arch(Task* t,
       return PREVENT_SWITCH;
     }
 
-    case Arch::sendmsg:
-      if (!((unsigned int)t->regs().arg3() & MSG_DONTWAIT)) {
-        return ALLOW_SWITCH;
-      }
-      return PREVENT_SWITCH;
-
     case Arch::sendmmsg: {
       auto vlen = (unsigned int)t->regs().arg3();
       syscall_state.reg_parameter(2, sizeof(typename Arch::mmsghdr) * vlen,
                                   IN_OUT);
-      if (!((unsigned int)t->regs().arg4() & MSG_DONTWAIT)) {
-        return ALLOW_SWITCH;
-      }
-      return PREVENT_SWITCH;
+      return ALLOW_SWITCH;
     }
 
     case Arch::getsockname:
@@ -2616,6 +2606,16 @@ static Switchable rec_prepare_syscall_arch(Task* t,
     case Arch::shmdt:
     case Arch::unshare:
       return PREVENT_SWITCH;
+
+    case Arch::sendto:
+    case Arch::sendmsg:
+      // If we send a message to a higher-priority thread that's blocking on
+      // receive, allow it to run immediately.
+    case Arch::kill:
+    case Arch::tgkill:
+      // If we send a signal to a higher-priority thread, allow it to run
+      // immediately.
+      return ALLOW_SWITCH;
 
     default:
       // Invalid syscalls return -ENOSYS. Assume any such

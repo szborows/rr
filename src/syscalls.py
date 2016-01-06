@@ -258,7 +258,7 @@ sync = EmulatedSyscall(x86=36, x64=162)
 #
 # The kill() system call can be used to send any signal to any
 # process group or process.
-kill = EmulatedSyscall(x86=37, x64=62)
+kill = IrregularEmulatedSyscall(x86=37, x64=62)
 
 #  int rename(const char *oldpath, const char *newpath)
 #
@@ -1317,7 +1317,7 @@ fstatfs64 = EmulatedSyscall(x86=269, arg3="typename Arch::statfs64")
 # to send a signal to a process (i.e., thread group) as a whole, and
 # the signal will be delivered to an arbitrary thread within that
 # process.)
-tgkill = EmulatedSyscall(x86=270, x64=234)
+tgkill = IrregularEmulatedSyscall(x86=270, x64=234)
 
 #  int utimes(const char *filename, const struct timeval times[2])
 #
@@ -1644,7 +1644,7 @@ rrcall_notify_syscall_hook_exit = IrregularEmulatedSyscall(x86=444, x64=444)
 socket = EmulatedSyscall(x64=41)
 connect = EmulatedSyscall(x64=42)
 accept = IrregularEmulatedSyscall(x64=43)
-sendto = EmulatedSyscall(x64=44)
+sendto = IrregularEmulatedSyscall(x64=44)
 recvfrom = IrregularEmulatedSyscall(x64=45)
 sendmsg = IrregularEmulatedSyscall(x64=46)
 recvmsg = IrregularEmulatedSyscall(x64=47)
