@@ -39,7 +39,10 @@ Task* Scheduler::get_next_task_with_same_priority(Task* t) {
   return it->second;
 }
 
-int Scheduler::choose_random_priority() { return random() % priority_levels; }
+int Scheduler::choose_random_priority() {
+  // Make a thread low-priority with probability 0.1
+  return (random() % 10) ? 0 : 1;
+}
 
 /**
  * Returns true if we should return t as the runnable task. Otherwise we
@@ -176,6 +179,13 @@ void Scheduler::setup_new_timeslice(Task* t) {
   t->timeslice_end = t->tick_count() + timeslice_duration;
 }
 
+static void sleep_time(double t) {
+  struct timespec ts;
+  ts.tv_sec = (time_t)floor(t);
+  ts.tv_nsec = (long)((t - ts.tv_sec)*1e9);
+  nanosleep(&ts, NULL);
+}
+
 void Scheduler::maybe_reset_priorities() {
   return;
   if (!enable_chaos) {
@@ -197,6 +207,33 @@ void Scheduler::maybe_reset_priorities() {
   for (Task* t : tasks) {
     update_task_priority_internal(t, choose_random_priority());
   }
+}
+
+static double random_frac() {
+  return double(random() % INT32_MAX)/INT32_MAX;
+}
+
+void Scheduler::maybe_reset_high_priority_only_intervals() {
+  if (high_priority_only_intervals_refresh_time == 0) {
+    double now = monotonic_now_sec();
+    // Stop scheduling low-priority threads for 0-2 seconds
+    double duration = random_frac()*2;
+    // Make the schedule-stop 20% of the total run time
+    double interval_length = duration*5;
+    double start = now + random_frac()*duration*4;
+    high_priority_only_intervals.push_back({start, start + duration});
+    high_priority_only_intervals_refresh_time = now + interval_length;
+  }
+}
+
+bool Scheduler::in_high_priority_only_interval() {
+  double now = monotonic_now_sec();
+  for (auto& i : high_priority_only_intervals) {
+    if (now >= i.start && now < i.end) {
+      return true;
+    }
+  }
+  return false;
 }
 
 Task* Scheduler::get_next_thread(Task* t, Switchable switchable,
@@ -237,20 +274,38 @@ Task* Scheduler::get_next_thread(Task* t, Switchable switchable,
   }
 
   Task* next = nullptr;
-  if (current) {
-    next = find_next_runnable_task(current, by_waitpid, current->priority - 1);
-    if (!next && !current->unstable && !always_switch &&
-        current->tick_count() < current->timeslice_end &&
-        is_task_runnable(current, by_waitpid)) {
-      LOG(debug) << "  Carrying on with task " << current->tid;
-      return current;
+  while (true) {
+    if (current) {
+      next = find_next_runnable_task(current, by_waitpid, current->priority - 1);
+      if (!next && !current->unstable && !always_switch &&
+          current->tick_count() < current->timeslice_end &&
+          is_task_runnable(current, by_waitpid)) {
+        LOG(debug) << "  Carrying on with task " << current->tid;
+        return current;
+      }
     }
-  }
 
-  LOG(debug) << "  need to reschedule";
+    LOG(debug) << "  need to reschedule";
 
-  if (!next) {
-    next = find_next_runnable_task(current, by_waitpid, INT32_MAX);
+    if (!next) {
+      next = find_next_runnable_task(current, by_waitpid, INT32_MAX);
+    }
+
+    if (next && next->priority > 0 && in_high_priority_only_interval()) {
+      if (*by_waitpid) {
+        LOG(debug) << "Waking up low-priority task with by_waitpid; not sleeping";
+        // We must run this low-priority task. Fortunately it's just waking
+        // up from a blocking syscall; we'll record the syscall event and then
+        // (unless it was an interrupted syscall) we'll return to
+        // get_next_thread, which will either run a higher priority thread
+        // or (more likely) reach here again but in the !*by_waitpid case.
+      } else {
+        LOG(debug) << "Waking up low-priority task without by_waitpid; sleeping";
+        sleep_time(0.1);
+        continue;
+      }
+    }
+    break;
   }
 
   if (next && !next->unstable) {
@@ -285,6 +340,14 @@ Task* Scheduler::get_next_thread(Task* t, Switchable switchable,
         << "Scheduled task should have been blocked or unstable";
     next->did_waitpid(status);
     *by_waitpid = true;
+  }
+
+  if (current && current != next) {
+    maybe_reset_high_priority_only_intervals();
+    LOG(debug) << "Switching from " << current->tid
+        << "(" << current->name() << ") to " << next->tid << "("
+        << next->name() << ") (priority " << current->priority
+        << " to " << next->priority << ") at " << current->trace_writer().time();
   }
 
   setup_new_timeslice(next);
