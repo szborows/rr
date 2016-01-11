@@ -2251,7 +2251,7 @@ static Switchable rec_prepare_syscall_arch(Task* t,
               target, (int)t->regs().arg3_signed());
         }
       }
-      return ALLOW_SWITCH;
+      return PREVENT_SWITCH;
 
     case Arch::pause:
       return ALLOW_SWITCH;

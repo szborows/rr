@@ -87,7 +87,8 @@ static bool is_task_runnable(Task* t, bool* by_waitpid) {
   return false;
 }
 
-Task* Scheduler::find_next_runnable_task(Task* t, bool* by_waitpid) {
+Task* Scheduler::find_next_runnable_task(Task* t, bool* by_waitpid,
+                                         int priority_threshold) {
   *by_waitpid = false;
 
   while (true) {
@@ -106,6 +107,9 @@ Task* Scheduler::find_next_runnable_task(Task* t, bool* by_waitpid) {
   for (auto same_priority_start = task_priority_set.begin();
        same_priority_start != task_priority_set.end();) {
     int priority = same_priority_start->first;
+    if (priority > priority_threshold) {
+      return nullptr;
+    }
     auto same_priority_end = task_priority_set.lower_bound(
         make_pair(same_priority_start->first + 1, nullptr));
 
@@ -232,15 +236,23 @@ Task* Scheduler::get_next_thread(Task* t, Switchable switchable,
     return current;
   }
 
-  if (current && !current->unstable && !always_switch &&
-      current->tick_count() < current->timeslice_end &&
-      is_task_runnable(current, by_waitpid)) {
-    return current;
+  Task* next = nullptr;
+  if (current) {
+    next = find_next_runnable_task(current, by_waitpid, current->priority - 1);
+    if (!next && !current->unstable && !always_switch &&
+        current->tick_count() < current->timeslice_end &&
+        is_task_runnable(current, by_waitpid)) {
+      LOG(debug) << "  Carrying on with task " << current->tid;
+      return current;
+    }
   }
 
   LOG(debug) << "  need to reschedule";
 
-  Task* next = find_next_runnable_task(current, by_waitpid);
+  if (!next) {
+    next = find_next_runnable_task(current, by_waitpid, INT32_MAX);
+  }
+
   if (next && !next->unstable) {
     LOG(debug) << "  selecting task " << next->tid;
   } else {
